@@ -65,24 +65,56 @@ export default async function handler(req, res) {
     (a.Name || "").toLowerCase().endsWith(".ics")
   );
 
-  if (cal?.Content) {
-    const icsText = decodeBase64ToUtf8(cal.Content);
-
-    const uid = firstMatch(icsText, /^UID:(.+)$/m);
-    const dtstart = firstMatch(icsText, /^DTSTART(?:;[^:]*)?:(.+)$/m);
-    const dtend = firstMatch(icsText, /^DTEND(?:;[^:]*)?:(.+)$/m);
-    const meetingUrl = extractMeetingUrl(icsText);
-    const attendees = extractAttendees(icsText);
-
-    console.log("=== Parsed Calendar Fields ===");
-    console.log("UID:", uid);
-    console.log("DTSTART:", dtstart);
-    console.log("DTEND:", dtend);
-    console.log("MEETING_URL:", meetingUrl);
-    console.log("ATTENDEES:", attendees);
-    console.log("=== End Parsed Fields ===");
-  } else {
+  if (!cal?.Content) {
     console.log("No ICS attachment found.");
+    res.status(200).json({ ok: true });
+    return;
+  }
+
+  const icsText = decodeBase64ToUtf8(cal.Content);
+
+  const uid = firstMatch(icsText, /^UID:(.+)$/m);
+  const dtstart = firstMatch(icsText, /^DTSTART(?:;[^:]*)?:(.+)$/m);
+  const dtend = firstMatch(icsText, /^DTEND(?:;[^:]*)?:(.+)$/m);
+  const meetingUrl = extractMeetingUrl(icsText);
+  const attendees = extractAttendees(icsText);
+
+  console.log("=== Parsed Calendar Fields ===");
+  console.log("UID:", uid);
+  console.log("DTSTART:", dtstart);
+  console.log("DTEND:", dtend);
+  console.log("MEETING_URL:", meetingUrl);
+  console.log("ATTENDEES:", attendees);
+  console.log("=== End Parsed Fields ===");
+
+  // ✅ Send parsed data to Base44
+  const base44Url = "https://hostwell.app/api/webhooks/inbound-calendar";
+
+  const payload = {
+    source: "postmark",
+    to: body.To,
+    subject: body.Subject,
+    uid,
+    dtstart,
+    dtend,
+    meetingUrl,
+    attendees
+  };
+
+  try {
+    const r = await fetch(base44Url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await r.text();
+    console.log("=== Base44 webhook response ===");
+    console.log("Status:", r.status);
+    console.log("Body:", text.slice(0, 500));
+    console.log("=== End Base44 response ===");
+  } catch (err) {
+    console.log("ERROR posting to Base44:", err?.message || err);
   }
 
   res.status(200).json({ ok: true });
