@@ -7,7 +7,6 @@ function firstMatch(text, regex) {
   return m ? m[1].trim() : null;
 }
 
-// Try multiple patterns to find a join link across Meet/Zoom/Teams
 function extractMeetingUrl(icsText) {
   const urlLine = firstMatch(icsText, /^URL:(.+)$/m);
   if (urlLine && urlLine.startsWith("http")) return urlLine;
@@ -35,14 +34,12 @@ function extractMeetingUrl(icsText) {
 
 function inferPlatformType(meetingUrl) {
   const u = (meetingUrl || "").toLowerCase();
-  if (u.includes("meet.google.com")) return "google_meet";
+  if (u.includes("meet.google.com")) return "meet";
   if (u.includes("zoom.us")) return "zoom";
-  if (u.includes("teams.microsoft.com")) return "microsoft_teams";
-  return meetingUrl ? "unknown" : null;
+  if (u.includes("teams.microsoft.com")) return "teams";
+  return meetingUrl ? "unknown" : "unknown";
 }
 
-// Extract attendee emails from lines like:
-// ATTENDEE;CN=Name;...:mailto:person@company.com
 function extractAttendees(icsText) {
   const attendees = new Set();
   const re = /^ATTENDEE(?:;[^:]*)?:mailto:([^\r\n]+)/gim;
@@ -55,9 +52,50 @@ function extractAttendees(icsText) {
 }
 
 function extractOrganizerEmail(icsText) {
-  // ORGANIZER;CN=Name:mailto:someone@domain.com
   const org = firstMatch(icsText, /^ORGANIZER(?:;[^:]*)?:mailto:([^\r\n]+)$/im);
   return org ? org.trim().toLowerCase() : null;
+}
+
+function extractCalendarMethod(icsText) {
+  return firstMatch(icsText, /^METHOD:(.+)$/m) || null;
+}
+
+// Parses common DTSTART formats like:
+// 20260116T230000Z
+// 20260116T230000
+// 20260116
+function icsDateToIso(icsVal) {
+  if (!icsVal) return null;
+  const v = icsVal.trim();
+
+  // Date only YYYYMMDD
+  if (/^\d{8}$/.test(v)) {
+    const y = v.slice(0, 4);
+    const mo = v.slice(4, 6);
+    const d = v.slice(6, 8);
+    return new Date(`${y}-${mo}-${d}T00:00:00Z`).toISOString();
+  }
+
+  // Date-time YYYYMMDDTHHMMSS(Z optional)
+  const m = v.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/);
+  if (m) {
+    const [_, y, mo, d, hh, mm, ss, z] = m;
+    const iso = `${y}-${mo}-${d}T${hh}:${mm}:${ss}${z ? "Z" : "Z"}`;
+    // Treat non-Z as UTC for now (good enough for MVP).
+    return new Date(iso).toISOString();
+  }
+
+  // Fallback: try Date parse
+  const dt = new Date(v);
+  return isNaN(dt.getTime()) ? null : dt.toISOString();
+}
+
+// Extract join_token from inbound "To" like:
+// "meet+abc123@meet.hostwell.app"
+function extractJoinToken(toField) {
+  const s = (toField || "").toString().toLowerCase();
+  const m = s.match(/meet\+([a-z0-9-_]+)@/i);
+  return m ? m[1] : null;
 }
 
 async function base44Fetch(path, { method = "GET", body } = {}) {
@@ -85,15 +123,11 @@ async function base44Fetch(path, { method = "GET", body } = {}) {
   let json = null;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch {
-    // keep json as null
-  }
+  } catch {}
 
   return { res, text, json, url };
 }
 
-// Best-effort “find by filter” helper.
-// Base44’s API page lists “Filterable fields”, and commonly supports query params like ?field=value.
 async function base44FindOne(entityName, field, value) {
   if (!value) return null;
 
@@ -105,7 +139,6 @@ async function base44FindOne(entityName, field, value) {
     return null;
   }
 
-  // Base44 may return { data: [...] } or just [...]
   const list = Array.isArray(json) ? json : (json?.data || json?.items || []);
   return list?.[0] || null;
 }
@@ -117,10 +150,9 @@ async function base44Create(entityName, data) {
   });
 
   if (!res.ok) {
-    console.log(`Base44 create ${entityName} failed`, res.status, url, text.slice(0, 500));
+    console.log(`Base44 create ${entityName} failed`, res.status, url, text.slice(0, 800));
     return null;
   }
-
   return json?.data || json;
 }
 
@@ -131,10 +163,9 @@ async function base44Update(entityName, id, data) {
   });
 
   if (!res.ok) {
-    console.log(`Base44 update ${entityName} failed`, res.status, url, text.slice(0, 500));
+    console.log(`Base44 update ${entityName} failed`, res.status, url, text.slice(0, 800));
     return null;
   }
-
   return json?.data || json;
 }
 
@@ -152,6 +183,8 @@ export default async function handler(req, res) {
   console.log("Subject:", body.Subject);
   console.log("Attachment count:", attachments.length);
 
+  const join_token = extractJoinToken(body.To);
+
   const cal = attachments.find(a =>
     (a.ContentType || "").toLowerCase().includes("text/calendar") ||
     (a.Name || "").toLowerCase().endsWith(".ics")
@@ -166,38 +199,59 @@ export default async function handler(req, res) {
   const icsText = decodeBase64ToUtf8(cal.Content);
 
   const uid = firstMatch(icsText, /^UID:(.+)$/m);
-  const dtstart = firstMatch(icsText, /^DTSTART(?:;[^:]*)?:(.+)$/m);
-  const dtend = firstMatch(icsText, /^DTEND(?:;[^:]*)?:(.+)$/m);
+  const dtstartRaw = firstMatch(icsText, /^DTSTART(?:;[^:]*)?:(.+)$/m);
+  const dtendRaw = firstMatch(icsText, /^DTEND(?:;[^:]*)?:(.+)$/m);
+
+  const startIso = icsDateToIso(dtstartRaw);
+  const endIso = icsDateToIso(dtendRaw);
+
   const meetingUrl = extractMeetingUrl(icsText);
   const attendees = extractAttendees(icsText);
   const organizerEmail = extractOrganizerEmail(icsText);
   const platformType = inferPlatformType(meetingUrl);
+  const calendarMethod = extractCalendarMethod(icsText);
+
+  // Base44 required fields
+  const title = (body.Subject || "").trim() || "Hostwell Meeting";
+  const scheduled_date = startIso; // required date-time
 
   console.log("=== Parsed Calendar Fields ===");
+  console.log("join_token:", join_token);
   console.log("UID:", uid);
-  console.log("DTSTART:", dtstart);
-  console.log("DTEND:", dtend);
+  console.log("DTSTART raw:", dtstartRaw);
+  console.log("DTEND raw:", dtendRaw);
+  console.log("startIso:", startIso);
+  console.log("endIso:", endIso);
   console.log("MEETING_URL:", meetingUrl);
   console.log("ATTENDEES:", attendees);
   console.log("ORGANIZER:", organizerEmail);
   console.log("PLATFORM:", platformType);
+  console.log("METHOD:", calendarMethod);
   console.log("=== End Parsed Fields ===");
 
-  // ---- Write to Base44 Entities API ----
   try {
-    // 1) Upsert Meeting by calendarEventUid
+    // Upsert Meeting by calendarEventUid (best key)
     const existingMeeting = await base44FindOne("Meeting", "calendarEventUid", uid);
 
     const meetingData = {
+      // required
+      title,
+      scheduled_date,
+      join_token,
+
+      // helpful
+      sourceType: "calendar_email",
       calendarEventUid: uid,
-      startTime: dtstart,
-      endTime: dtend,
+      calendarMethod,
+      organizerEmail,
+      startTime: startIso,
+      endTime: endIso,
+      meetingTitle: title,
+      platformType,
       platformMeetingUrl: meetingUrl,
-      organizerEmail: organizerEmail,
-      meetingTitle: body.Subject || null,
-      platformType: platformType,
-      sourceType: "calendar",
+      meeting_url: meetingUrl,
       lastCalendarUpdateAt: new Date().toISOString(),
+      status: calendarMethod === "CANCEL" ? "canceled" : "scheduled"
     };
 
     const meeting =
@@ -205,45 +259,15 @@ export default async function handler(req, res) {
         ? await base44Update("Meeting", existingMeeting.id, meetingData)
         : await base44Create("Meeting", meetingData);
 
-    const meetingId = meeting?.id || meeting?.data?.id || meeting?.entity?.id;
+    const meetingId = meeting?.id || meeting?.data?.id;
 
     console.log("Base44 Meeting ID:", meetingId);
 
-    // 2) Upsert Guests by email, then link MeetingGuest
-    if (meetingId && Array.isArray(attendees)) {
-      for (const email of attendees) {
-        const existingGuest = await base44FindOne("Guest", "email", email);
-
-        const guest =
-          existingGuest?.id
-            ? existingGuest
-            : await base44Create("Guest", { email });
-
-        const guestId = guest?.id || guest?.data?.id;
-
-        if (!guestId) continue;
-
-        // Link table (best effort). If your MeetingGuest entity uses different field names,
-        // we’ll adjust after we see one response.
-        // Try to avoid duplicates by searching first.
-        const existingLink = await base44FindOne("MeetingGuest", "meetingId", meetingId);
-        // If that filter is too broad, it will just create duplicates; we’ll refine next step.
-
-        if (!existingLink) {
-          await base44Create("MeetingGuest", {
-            meetingId,
-            guestId,
-            guestEmail: email,
-          });
-        }
-      }
-    }
-
-    console.log("=== Base44 write complete ===");
+    // For now: just log attendees. We’ll wire Guest + MeetingGuest next once Meeting write is confirmed.
+    console.log("Attendees to link next:", attendees);
   } catch (err) {
-    console.log("ERROR writing to Base44:", err?.message || err);
+    console.log("ERROR writing Meeting to Base44:", err?.message || err);
   }
 
-  // Always respond 200 so Postmark doesn’t retry endlessly during early dev
   res.status(200).json({ ok: true });
 }
